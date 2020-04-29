@@ -1,0 +1,164 @@
+PYTHON_COMPONENTS = [
+    "bubbly-cmd",
+    "bubbly-backend/api-service",
+    "bubbly-backend/metrics-service"
+]
+def pythonDependencies(directory) {
+    return {
+        stage("Install deps - ${directory}") {
+            container("pybuild") {
+                dir("${directory}") {
+                    sh "PIPENV_NOSPIN=1 pipenv install --dev"
+                }
+            }
+        }
+    }
+}
+def pythonSCA(directory) {
+    return {
+        stage("Static analysis - ${directory}") {
+            container("pybuild") {
+                dir("${directory}") {
+                    // TODO: Allow steps to fail?
+                    sh """
+                        pipenv run mypy \
+                            --ignore-missing-imports \
+                            --no-error-summary \
+                            --show-column-numbers \
+                            --show-error-codes \
+                            . > mypy.txt || echo "mypy exited with \$"
+                    """
+                }
+            }
+        }
+    }
+}
+def pythonTest(directory) {
+    return {
+        stage("Unit test - ${directory}") {
+            container("pybuild") {
+                dir("${directory}") {
+                    // TODO: Customise error codes?
+                    sh """pipenv run -- pytest . -v > pytest.log || echo 'pytest exited with \$'"""
+                    sh "cat pytest.log"
+                }
+            }
+        }
+    }
+}
+def pythonDepSteps = PYTHON_COMPONENTS.collectEntries { el -> ["$el": pythonDependencies(el)] }
+def pythonSCASteps = PYTHON_COMPONENTS.collectEntries { el -> ["$el": pythonSCA(el)] }
+def pythonTestSteps = PYTHON_COMPONENTS.collectEntries { el -> ["$el": pythonTest(el)] }
+def allDepSteps = pythonDepSteps
+allDepSteps["bubbly-web"] = {
+    stage("bubbly-web") {
+        container("nodebuild"){
+            dir("bubbly-web"){
+                sh "yarn install --dev"
+            }
+        }
+    }
+}
+def allTestSteps = pythonTestSteps
+allTestSteps["bubbly-web"] = {
+    stage("bubbly-web") {
+        container("nodebuild"){
+            dir("bubbly-web"){
+                sh """
+                    yarn run test:no-watch > jest.log
+                    cat jest.log
+                """
+            }
+        }
+    }
+}
+pipeline {
+    agent {
+      kubernetes {
+        label "bubbly"
+        defaultContainer "jnlp"
+        yamlFile "KubernetesPod.yaml"
+      }
+    }
+    stages {
+      stage("Set up images") {
+        steps {
+            container("pybuild") {
+                sh "pip install pipenv pylint pylint-exit --upgrade"
+            }
+        }
+      }
+    stage("Install dependencies") {
+        steps {
+            script {
+                parallel allDepSteps
+            }
+        }
+    }
+    stage("Static analysis") {
+        steps {
+            script {
+                parallel pythonSCASteps
+            }
+        }
+    }
+    stage("Unit Test") {
+        options {
+            catchError(message: "Test failed", stageResult: "UNSTABLE", buildResult: "UNSTABLE")
+        }
+        steps {
+            script {
+                parallel allTestSteps
+            }
+        }
+    }
+    stage("Collect findings") {
+        parallel {
+            stage("pylint") {
+                steps {
+                    container("pybuild") {
+                        // TODO: Refine to run each component in parallel
+                        sh "python pipeline-utils/pylint_globs.py bubbly-cmd/**/*.py bubbly-backend/**/*.py > pylint.txt || pylint-exit \$?"
+                    }
+                }
+            }
+            stage("mypy") {
+                steps {
+                    container("pybuild") {
+                        sh "python pipeline-utils/mypy_to_sonar.py mypy_out.json **/mypy.txt"
+                    }
+                }
+            }
+        }
+    }
+    stage("Sonarqube"){
+      steps {
+        container("sonar-scanner") {
+            withSonarQubeEnv("SonarQube") {
+                // TODO: Dogfood with bubbly
+                // TODO: Import jest results
+                // TODO: Import pytest results
+                // TODO: Set up SonarQube for .tsx
+                sh """
+                    sonar-scanner \
+                    -Dsonar.projectKey=Bubbly \
+                    -Dsonar.sources=. \
+                    -Dsonar.sourceEncoding=UTF-8 \
+                    -Dsonar.python.pylint.reportPath=pylint.txt \
+                    -Dsonar.externalIssuesReportPaths=mypy_out.json
+                """
+            }
+            timeout(time: 15, unit: 'MINUTES') {
+                script {
+                    def sqGate = waitForQualityGate()
+                    if (sqGate.status != "OK") {
+                        echo "SonarQube Quality Gate failed with status ${sqGate.status}"
+                        currentBuild.result = 'UNSTABLE'
+                    }
+                }
+            }
+        }
+      }
+    }
+  }
+}
