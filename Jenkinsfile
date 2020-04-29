@@ -2,7 +2,6 @@ pipeline {
 	agent {
     kubernetes {
       label 'vscode'
-      defaultContainer 'jnlp'
       yaml """
 apiVersion: v1
 kind: Pod
