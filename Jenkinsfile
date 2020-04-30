@@ -1,14 +1,17 @@
 pipeline {
-	agent {
+  agent {
     kubernetes {
-      label 'vscode'
+      defaultContainer "yarn-build"
       yaml """
 apiVersion: v1
 kind: Pod
+metadata:
+  labels:
+    some-label: some-label-value
 spec:
   containers:
   - name: yarn-build
-    image: node:lts-buster
+    image: node:erbium
     command:
     - cat
     tty: true
@@ -16,14 +19,12 @@ spec:
     }
   }
   stages {
-    stage('Build') {
+    stage("Build") {
       steps {
-        container('yarn-build') {
-					sh '''
-					yarn
-					yarn compile
-					'''
-        }
+        sh """
+        yarn
+        yarn compile
+        """
       }
     }
   }
